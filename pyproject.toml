@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "evalforge"
-version = "0.1.0"
-description = "A production evaluation harness: versioned runs, budgeted scorers, and a gate that refuses to guess"
+version = "0.2.0"
+description = "An evaluation harness that computes the error bar before the verdict, and says INCONCLUSIVE instead of PASS"
 requires-python = ">=3.10"
 dependencies = []
 

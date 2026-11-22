@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from . import runner
-from .gate import GatePolicy, RunSummary, evaluate
+from .gate import CategoryRecall, GatePolicy, RunSummary, evaluate, power_report
 from .spec import ExecutionPolicy, RunSpec, ScorerRef, sha256_of
 
 
@@ -57,10 +57,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 def _summary(path: str) -> RunSummary:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     m = data["metrics"]
+    recall: dict[str, CategoryRecall] = {}
+    for cat, counts in (m.get("recall_counts") or {}).items():
+        recall[cat] = CategoryRecall(int(counts[0]), int(counts[1]))
     return RunSummary(
         run_id=data["run_id"],
         coverage=float(m.get("coverage", 0.0)),
-        recall_by_category={k: float(v) for k, v in (m.get("recall_by_category") or {}).items()},
+        recall=recall,
         false_alarm_rate=float(m.get("false_alarm_rate", 0.0)),
         overrun_inr=float((data.get("budget") or {}).get("overrun", 0.0)),
     )
@@ -70,13 +73,15 @@ def cmd_gate(args: argparse.Namespace) -> int:
     result = evaluate(
         _summary(args.candidate),
         _summary(args.baseline),
-        GatePolicy(
-            min_coverage=args.min_coverage,
-            recall_drop_tolerance=args.recall_tolerance,
-        ),
+        GatePolicy(min_coverage=args.min_coverage, tolerance=args.recall_tolerance),
     )
     print(json.dumps(result.to_dict(), indent=2))
     return result.exit_code
+
+
+def cmd_power(args: argparse.Namespace) -> int:
+    print(json.dumps(power_report(args.baseline, args.n), indent=2))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,6 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--min-coverage", type=float, default=0.98)
     g.add_argument("--recall-tolerance", type=float, default=0.02)
     g.set_defaults(func=cmd_gate)
+
+    pw = sub.add_parser("power", help="what regression can this sample size actually detect?")
+    pw.add_argument("--n", type=int, required=True, help="items per arm")
+    pw.add_argument("--baseline", type=float, required=True, help="baseline recall, e.g. 0.90")
+    pw.set_defaults(func=cmd_power)
     return p
 
 

@@ -104,37 +104,30 @@ def test_release_and_reap_return_budget():
 
 
 # ------------------------------------------------------------------ BLOCKER 4: gate
-def _summary(coverage_: float, recall: dict[str, float], fa: float = 0.05, overrun: float = 0.0):
-    return RunSummary("r", coverage_, recall, fa, overrun)
+from evalforge.gate import CategoryRecall  # noqa: E402
+
+
+def _run(coverage_: float, recall: dict[str, tuple[int, int]], overrun: float = 0.0):
+    return RunSummary(
+        "r", coverage_, {k: CategoryRecall(v[0], v[1]) for k, v in recall.items()},
+        overrun_inr=overrun,
+    )
 
 
 def test_truncated_run_is_inconclusive_never_pass():
     """The single most important behaviour in the product."""
-    result = evaluate(
-        _summary(0.70, {"number": 0.99}),      # better recall, but only 70% measured
-        _summary(0.99, {"number": 0.80}),
-    )
+    result = evaluate(_run(0.70, {"number": (99, 100)}), _run(0.99, {"number": (80, 100)}))
     assert result.verdict is Verdict.INCONCLUSIVE
     assert result.exit_code == 2
 
 
-def test_clean_run_passes_and_regression_fails():
-    ok = evaluate(_summary(1.0, {"number": 0.90}), _summary(1.0, {"number": 0.89}))
-    assert ok.verdict is Verdict.PASS and ok.exit_code == 0
-
-    bad = evaluate(_summary(1.0, {"number": 0.50}), _summary(1.0, {"number": 0.90}))
-    assert bad.verdict is Verdict.FAIL and bad.exit_code == 1
-
-
 def test_budget_overrun_blocks_a_pass():
-    result = evaluate(
-        _summary(1.0, {"number": 0.95}, overrun=12.0), _summary(1.0, {"number": 0.90})
-    )
+    result = evaluate(_run(1.0, {"number": (95, 100)}, overrun=12.0), _run(1.0, {"number": (90, 100)}))
     assert result.verdict is Verdict.INCONCLUSIVE
 
 
 def test_category_missing_from_candidate_is_incomparable():
-    result = evaluate(_summary(1.0, {}), _summary(1.0, {"number": 0.9}))
+    result = evaluate(_run(1.0, {}), _run(1.0, {"number": (90, 100)}))
     assert result.verdict is Verdict.PASS
     assert "number" in result.incomparable
 

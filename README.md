@@ -1,143 +1,116 @@
 # EvalForge
 
-A production evaluation harness. Versioned runs, budgeted scorers, and a gate that refuses
-to guess.
+**Most LLM evals are statistically underpowered, and their gates pass regressions they were built to catch.**
 
-The interesting thing about this repository is not that it works — it's *how it was designed*.
-It was built with Google's [Elephant-Goldfish Model](https://github.com/google/elephant-goldfish-model):
-a context-rich design phase, then **three stateless adversarial reviewers** who saw only the
-design document and none of the author's reasoning. They found five blockers that invalidated
-the first design's headline claims. Those five blockers are the reason the code looks the way
-it does, and each one has a test that fails if its fix is removed.
+This repository is an evaluation harness that computes the error bar before it computes the verdict — and says "I can't tell" instead of "pass".
 
-The reviews are checked in, unedited, in [`docs/reviews/`](docs/reviews/).
+```
+$ evalforge power --n 108 --baseline 0.9
+with 108 items this eval can only detect a regression of 11.4% or larger
 
----
+$ # a real 6-point regression: 90% → 84%
+n=50       verdict=inconclusive   (this eval can only see a 16.8% drop)
+n=500      verdict=inconclusive   (5.3%)
+n=10000    verdict=fail           (1.2%)
+```
 
-## The process, in order
-
-| Phase | Artefact | What happened |
-|---|---|---|
-| **Elephant** — design | [`DESIGN.md`](DESIGN.md) | Wrote the architecture with full context: goals, non-goals, components, risks. No code. |
-| **Goldfish** — adversarial review | [`docs/reviews/`](docs/reviews/) | Three fresh-context reviewers (SRE, staff engineer, security + readiness) each produced 12–15 findings. Verdict: **NOT READY**. |
-| **Elephant** — resolve | [`DESIGN_v2_RESOLUTIONS.md`](DESIGN_v2_RESOLUTIONS.md) | Each blocker answered with a decision, not a defence. |
-| **Build** | `src/evalforge/` | Implemented against the resolutions. |
-| **Verify** | `tests/test_blockers.py` | One test per blocker, named after the defect. |
-
-### What the Goldfish killed
-
-All three independently found the same five defects. Convergence across reviewers with no
-shared context is the signal that a finding is real.
-
-| # | Blocker | Why the first design was wrong |
-|---|---|---|
-| 1 | **Digest vs budget** | Budget lived in the spec hash but the ledger decided *which items got scored*. Same spec, different truncation, different digest — so "same spec ⇒ same digest" was false. `score() -> []` also meant both "clean" and "never looked at". |
-| 2 | **Tier-0 isolation** | "A context object with no provider client" is capability *hiding*. A scorer can `import httpx`. |
-| 3 | **Reserve/settle** | Simulated with *correct* accounting: 8 workers, ₹100 ceiling, estimate ₹10, actual ₹30 → settled **₹120**. "Never overspends" was arithmetically false, and crashed workers leaked reservations. |
-| 4 | **The gate** | Recall is a ratio. A run that skipped 40% of items computed recall over a different population from its baseline and could **pass a real regression**. |
-| 5 | **The queue** | `SELECT … FOR UPDATE SKIP LOCKED` alone is not a queue: no lease, no heartbeat, no reaper. A `kill -9` stranded the row as `running` forever. |
-
-### How each was answered
-
-| # | Fix | Test |
-|---|---|---|
-| 1 | Coverage is a **digested** quantity. A truncated run has a different digest by construction. Budget moved out of `RunSpec` into `ExecutionPolicy`, recorded on the run row. | `test_truncation_changes_the_digest` |
-| 2 | Tier-0 scorers execute inside `egress.blocked()`, which replaces the socket entry points. A network attempt raises and the item is marked `failed`, never silently scored. | `test_tier0_scorer_cannot_open_a_socket` |
-| 3 | Atomic `reserve` with the ceiling in the `WHERE` clause; `settle` charges at most the reservation and records the excess as **overrun**, which is reported and blocks the gate; every reservation has a TTL and a reaper. | `test_reservations_cannot_exceed_the_ceiling`, `test_settle_records_overrun_instead_of_hiding_it` |
-| 4 | Three outcomes — `PASS` / `FAIL` / `INCONCLUSIVE` — with a coverage precondition. A truncated run or a budget overrun returns `INCONCLUSIVE`, never `PASS`. | `test_truncated_run_is_inconclusive_never_pass` |
-| 5 | Claims are leases: `lease_expires_at` + `attempts`, `heartbeat()` while working, `reap()` requeues expired leases and dead-letters past `max_attempts`. The transaction never spans item processing. | `test_expired_lease_is_reclaimed`, `test_max_attempts_dead_letters` |
+The same regression, the same code, three different answers — because the sample size decides what is *knowable*, not the threshold you picked. A gate that returns `PASS` at n=50 is not measuring quality. It is measuring noise and calling it a release.
 
 ---
+
+## The claim, stated so it can be attacked
+
+An eval harness reporting "96.1% recall" without an interval is doing numerology. With ~100 items, the 95% interval on a recall **difference** is roughly ±9 points. That means:
+
+- Most "improvements" teams celebrate are inside the noise.
+- Most "regressions" they block are too.
+- And critically — a run too small to detect a regression will report the *absence of evidence* as *evidence of absence*.
+
+EvalForge makes that impossible. The gate decides on confidence intervals, and it has a third outcome:
+
+| Verdict | Exit | Meaning |
+|---|---|---|
+| `PASS` | 0 | the interval **rules out** a regression larger than tolerance |
+| `FAIL` | 1 | the interval puts the regression **confidently above** tolerance |
+| `INCONCLUSIVE` | 2 | the sample is too small to rule it out either way |
+
+`INCONCLUSIVE` is the product. A two-state gate forces a lie: it either blocks a release over noise or passes a run it could not have measured.
 
 ## Quickstart
 
 ```bash
-git clone <this repo> && cd evalforge
+git clone https://github.com/Hemakrishna7406/evalforge && cd evalforge
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-pytest -q                                  # 15 tests
+evalforge power --n 108 --baseline 0.9      # what can this eval see?
+pytest -q                                    # 23 tests
 evalforge run --dataset data/sample.jsonl --out ./runs/a
 evalforge gate --candidate ./runs/a/run.json --baseline ./runs/a/run.json
 ```
 
-The gate exits **0** (pass), **1** (regression), **2** (inconclusive). The third exit code
-exists so CI can distinguish "it broke" from "we couldn't measure it".
+## What's inside
 
-## Architecture
-
-```
-CLI / CI ──▶ runner ──▶ ItemQueue (leases)  ──▶ scorers (tier 0, egress-blocked)
-                │                              └▶ scorers (tier 1, budgeted)
-                ├──▶ Ledger (atomic reserve / settle / release / reap)
-                └──▶ digest (items + statuses + coverage) ──▶ report
-                                                          └▶ gate (PASS/FAIL/INCONCLUSIVE)
-```
-
-Every module has one job and one failure mode it owns:
-
-| Module | Owns |
+| Module | Responsibility |
 |---|---|
-| `spec.py` | Run identity. What makes two runs *the same run*. |
-| `digest.py` | Proof that two runs measured the same thing, including what they missed. |
-| `ledger.py` | Spend, with the ceiling in the `WHERE` clause and overrun made visible. |
-| `queue.py` | Item liveness under crashes and deploys. |
-| `egress.py` | The tier-0 network boundary. |
-| `gate.py` | The verdict, and the refusal to guess. |
-| `runner.py` | Composition, and nothing else. |
+| `stats.py` | Wilson intervals, difference intervals, MDE, required-n, bootstrap. Dependency-free, seeded, deterministic. |
+| `gate.py` | Interval-based three-way verdict, per-category CIs, power report. |
+| `digest.py` | Run fingerprint that **includes coverage**, so a truncated run cannot masquerade as a complete one. |
+| `ledger.py` | Atomic budget reservations; overrun is measured and blocks a pass. |
+| `queue.py` | Lease-based item claims with heartbeat, reaper, dead-lettering. |
+| `egress.py` | Denies network to tier-0 scorers at the socket, not the API. |
+| `spec.py` | Run identity: what makes two runs the same run. |
 
-## What is actually implemented
+Two numbers this repository refuses to hide: every report carries its **minimum detectable effect**, and every gate verdict carries the **interval it was decided on**.
 
-Honest scope, because a README that oversells is worse than a small one.
+---
 
-**Working, tested (15 tests):**
-- Run identity and content-addressed hashing
-- Digest over item outcomes **and** coverage; order-independent; truncation-sensitive
-- Budget ledger: atomic reserve, overrun accounting, release, TTL reaper
-- Lease-based queue: claim, heartbeat, reap, dead-letter
-- Tier-0 egress guard with restore-on-exit
-- Four free scorers (`empty_output`, `numeric_preservation`, `repetition`, `length_ratio`)
-- Three-outcome gate with coverage and overrun preconditions
-- CLI: `run`, `gate`
+## How this was designed
 
-**Designed but not built (documented, not pretended):**
-- **Postgres backend.** The SQL is written for both SQLite and Postgres, and `claim()` emits
-  `FOR UPDATE SKIP LOCKED` under `dialect="postgresql"`, but only SQLite is exercised by the
-  tests. This is the largest gap.
-- **REST API, worker process, Docker Compose, Prometheus export.** Designed in `DESIGN.md` §4–6.
-- **LLM judge (tier 1).** The budget plumbing and the failure path exist; the provider client
-  does not.
-- **Multi-tenancy.** v0.1 is explicitly single-tenant. The `project_id` column is not there
-  yet and no isolation is claimed — per resolution R6, claiming a control you don't exercise
-  is worse than not having it.
-- **Plugin sandbox.** `egress.blocked()` stops accident, not hostile code. Real isolation
-  (subprocess + no-network namespace) is v0.2.
+Built with Google's [Elephant-Goldfish Model](https://github.com/google/elephant-goldfish-model): an "Elephant" session holds context and writes a design document with no code; "Goldfish" sessions are stateless agents that review it adversarially, sharing none of the author's assumptions.
 
-## Known limitations, stated plainly
+Three Goldfish — an SRE, a staff engineer, and a security/readiness reviewer — were given only [`DESIGN.md`](DESIGN.md). All three independently found the same five defects, and their verdict was **NOT READY**:
 
-- **Cross-machine determinism is not claimed.** Canonical JSON with fixed float formatting
-  handles dict ordering and float repr, but not BLAS dispatch differences or Unicode
-  normalisation. Same-machine determinism is tested; cross-machine is not.
-- **The egress guard is not a sandbox.** It patches stdlib entry points; determined code can
-  get around it. It is a guard against mistake, and the README says so.
-- **The gate compares recall by category only.** It has no notion of statistical significance;
-  tolerances are absolute thresholds, not confidence intervals.
-- **Single-writer queue.** Correct under one worker and safe under several, but only SQLite
-  is tested.
+| Blocker | Why v1 was wrong |
+|---|---|
+| Budget vs digest | Budget decided which items got scored, so the same spec produced different digests. The reproducibility guarantee was false. |
+| Tier-0 isolation | "A context object with no client" is capability *hiding*. A scorer can `import httpx`. |
+| Reserve/settle | One reviewer **simulated it**: ₹100 ceiling, 8 workers, est ₹10 / actual ₹30 → settled **₹120**. |
+| The gate | A run skipping 40% of items measured a different population and could pass a real regression. |
+| The queue | No lease, no reaper: a `kill -9` stranded the item as `running` forever. |
+
+Every finding is answered in [`DESIGN_v2_RESOLUTIONS.md`](DESIGN_v2_RESOLUTIONS.md) — with a decision, not a defence. Where a claim could not be defended it was **removed**: multi-tenancy was dropped entirely, because claiming an isolation control you never test is worse than not having one.
+
+The reviews are checked in unedited in [`docs/reviews/`](docs/reviews/). Publishing the criticism next to the code is the evidence that the design survived review rather than avoided it.
+
+## What is built, and what is not
+
+**Working and tested (23 tests):** statistics and power analysis; interval-based gate with per-category CIs; coverage-aware digest; budget ledger with overrun accounting and TTL reaper; lease-based queue with dead-lettering; tier-0 egress guard; four free scorers; CLI (`run`, `gate`, `power`).
+
+**Designed, not built — stated rather than implied:**
+- **Postgres backend.** SQL is written for both dialects and `claim()` emits `FOR UPDATE SKIP LOCKED` under Postgres, but only SQLite is exercised by tests. Largest gap.
+- REST API, worker process, Docker Compose, Prometheus export (`DESIGN.md` §4–6).
+- LLM judge (tier 1): budget plumbing and failure path exist; the provider client does not.
+- Multi-tenancy: v0.1 is single-tenant, and says so.
+- Plugin sandbox: `egress.blocked()` stops accidents, not hostile code.
+
+## Known limits
+
+- **The statistics are frequentist and two-proportion.** No sequential testing yet, so peeking at a run mid-flight inflates error rates — a real limitation, documented rather than hidden.
+- **Cross-machine determinism is not claimed.** Canonical JSON with fixed float formatting handles dict ordering; it does not handle BLAS dispatch or Unicode normalisation.
+- **The egress guard is not a sandbox.** It patches stdlib entry points.
+- **The gate compares recall by category.** False-alarm rate is reported but not yet interval-tested.
 
 ## Roadmap
 
-1. **v0.2** — Postgres backend + integration tests against a real database; REST API; worker
-   process; Docker Compose; Prometheus metrics with bounded labels only.
-2. **v0.3** — LLM judge with cache-by-exact-input and consistency sampling; provider client
-   with retry, circuit breaker, and distributed rate limiting.
-3. **v0.4** — Plugin sandbox (subprocess + seccomp); multi-tenant RLS with an isolation test
-   that actually attempts a cross-tenant read.
+1. **v0.2** — sequential/always-valid inference so peeking is safe; interval-tested false alarms; Postgres backend with integration tests.
+2. **v0.3** — LLM judge with measured TPR/TNR propagated into the final interval, so judge noise is part of the error bar rather than invisible.
+3. **v0.4** — plugin sandbox (subprocess + seccomp); multi-tenant RLS with an isolation test that attempts a cross-tenant read.
 
 ## AI assistance
 
-The design was written with an AI assistant acting as the Elephant. The adversarial reviews
-were produced by three separate stateless AI reviewers given only the document — Google's
-Goldfish pattern. Every finding they raised is answered in `DESIGN_v2_RESOLUTIONS.md`, and the
-ones that were out of scope are listed as limitations rather than quietly dropped. Human
-judgment decided which blockers to fix, which to bound, and which to defer.
+Design and adversarial review were AI-assisted under the Elephant-Goldfish pattern; the reviews in `docs/reviews/` were produced by three stateless reviewers given only the design document. Human judgement chose which blockers to fix, which to bound, and which to defer — and the deferrals are listed above rather than omitted.
+
+## License
+
+MIT
